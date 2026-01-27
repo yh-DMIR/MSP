@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Dynamic multi-GPU benchmark runner for Orion-MSP (ROCm friendly).
+"""Dynamic multi-GPU benchmark runner for Orion-MSP (AMD/ROCm friendly).
 
-- Dynamic scheduling via N worker processes pulling tasks from a shared JSONL queue.
+This script mirrors the output layout and multi-process scheduling strategy of
+`benchmark_tabicl_dynamic.py`, but evaluates `OrionMSPClassifier`.
+
+Key features:
+- Dynamic scheduling (work stealing): N worker processes pull datasets from a shared queue.
 - Each worker binds to one GPU via HIP_VISIBLE_DEVICES=<gpu_id> and uses device "cuda:0".
-- Writes per-worker CSVs, merges into one ALL CSV, and writes ONE global summary TXT.
-- Adds TabICL-like timing summary:
-  started_at / finished_at / wall_seconds / wall_time_hms
+- Writes per-worker CSVs, merges into one ALL CSV, and writes ONE global summary TXT:
+  - discovered_pairs: number of valid (train,test) pairs found
+  - processed_pairs: number of attempted datasets (ok + fail rows written)
+  - missing_test_datasets: train exists but test missing
+  - failed_datasets: datasets with status=fail (including worker crash marker if any)
+  - avg_accuracy_ok: mean accuracy over all OK results
+  - avg_accuracy_ok_top_{27,63,154}: mean accuracy of top-N datasets by accuracy (descending),
+    computed only if #OK-with-accuracy >= N.
+  - wall_seconds: total elapsed wall time of the whole run (from start to end)
+  - wall_time_hms: wall time formatted as H:MM:SS
+  - started_at / finished_at: timestamps (local time)
 
-AUTO-DOWNLOAD POLICY (requested):
-- By default: ALLOW auto-download checkpoint.
-- If --no-auto-download is set: DISALLOW auto-download.
-- If --ckpt is provided but does not exist:
-    - default: ignore the path and allow auto-download
-    - with --no-auto-download: raise error
+Example:
+  python benchmark_orion_msp_dynamic.py \
+    --root limix/tabzilla_csv \
+    --out-dir results/msp_dynamic/tabzilla \
+    --workers 8 \
+    --ckpt ./Orion-MSP-v1.0.ckpt \
+    --no-auto-download \
+    --device cuda:0
 """
 
 from __future__ import annotations
@@ -37,6 +50,10 @@ import warnings
 
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
+# -----------------------------
+# Helpers: dataset discovery
+# -----------------------------
+
 TARGET_CANDIDATES = [
     "target", "label", "class", "y",
     "TARGET", "Label", "Class", "Y",
@@ -44,6 +61,7 @@ TARGET_CANDIDATES = [
 
 
 def _fmt_hms(seconds: float) -> str:
+    """Format seconds into H:MM:SS."""
     total = int(round(seconds))
     h = total // 3600
     m = (total % 3600) // 60
@@ -59,6 +77,11 @@ def sanitize_dataset_id(train_path: Path) -> str:
 
 
 def discover_train_test_pairs(root: Path) -> Tuple[List[Tuple[Path, Path, str]], List[str]]:
+    """
+    Returns:
+        pairs: list of (train_csv, test_csv, dataset_id)
+        missing_test_ids: train exists but no matching test
+    """
     root = root.expanduser().resolve()
     trains = sorted(root.rglob("*_train.csv")) + sorted(root.rglob("*_TRAIN.csv"))
     pairs: List[Tuple[Path, Path, str]] = []
@@ -82,8 +105,13 @@ def find_target_column(df: pd.DataFrame) -> str:
     for c in TARGET_CANDIDATES:
         if c in cols:
             return c
+    # fallback: last column
     return cols[-1]
 
+
+# -----------------------------
+# MSP evaluation (single dataset)
+# -----------------------------
 
 def eval_one_dataset(
     train_csv: Path,
@@ -92,7 +120,12 @@ def eval_one_dataset(
     clf_kwargs: Dict,
     verbose: bool = False,
 ) -> Dict:
+    """
+    Runs one dataset and returns dict of metrics.
+    This function is called inside each worker process.
+    """
     t0 = time.time()
+
     try:
         train_df = pd.read_csv(train_csv)
         test_df = pd.read_csv(test_csv)
@@ -106,7 +139,7 @@ def eval_one_dataset(
         y_test = test_df[target_col]
         X_test = test_df.drop(columns=[target_col])
 
-        # Local import to avoid GPU init in parent process
+        # Local import to avoid CUDA init in parent
         from orion_msp import OrionMSPClassifier  # type: ignore
 
         clf = OrionMSPClassifier(**clf_kwargs)
@@ -117,6 +150,7 @@ def eval_one_dataset(
         acc = accuracy_score(y_test, y_pred)
         f1 = f1_score(y_test, y_pred, average="macro")
 
+        # logloss (if proba available)
         ll = None
         try:
             if hasattr(clf, "predict_proba"):
@@ -166,6 +200,10 @@ def eval_one_dataset(
         }
 
 
+# -----------------------------
+# Multiprocessing worker loop
+# -----------------------------
+
 @dataclass
 class ResultRow:
     status: str
@@ -194,17 +232,24 @@ def worker_loop(
     clf_kwargs: Dict,
     verbose: bool = False,
 ) -> None:
-    # Bind GPU for ROCm; inside worker always use cuda:0 after remap.
+    """
+    Each worker pops tasks from a shared JSONL queue file (simple file lock).
+    Binds to one GPU by setting HIP_VISIBLE_DEVICES.
+    """
+    # bind GPU for ROCm
     os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_id)
 
+    # IMPORTANT: inside worker, use cuda:0 after HIP_VISIBLE_DEVICES remap
     clf_kwargs = dict(clf_kwargs)
     clf_kwargs["device"] = "cuda:0"
 
     rows: List[Dict] = []
 
+    # crude file lock via mkdir
     lock_dir = queue_path.parent / (queue_path.name + ".lock")
 
     while True:
+        # acquire lock
         acquired = False
         for _ in range(2000):
             try:
@@ -215,6 +260,7 @@ def worker_loop(
                 time.sleep(0.01)
 
         if not acquired:
+            # mark worker crash
             rows.append(
                 asdict(
                     ResultRow(
@@ -245,14 +291,17 @@ def worker_loop(
 
             lines = queue_path.read_text(encoding="utf-8").splitlines()
             if not lines:
+                # done
                 queue_path.unlink(missing_ok=True)
                 break
 
+            # pop one task
             first = lines[0]
             rest = lines[1:]
             queue_path.write_text("\n".join(rest) + ("\n" if rest else ""), encoding="utf-8")
 
         finally:
+            # release lock
             try:
                 lock_dir.rmdir()
             except Exception:
@@ -271,11 +320,23 @@ def worker_loop(
             verbose=verbose,
         )
 
-        rows.append(asdict(ResultRow(worker_id=worker_id, gpu_id=gpu_id, **result)))
+        rows.append(
+            asdict(
+                ResultRow(
+                    worker_id=worker_id,
+                    gpu_id=gpu_id,
+                    **result,
+                )
+            )
+        )
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(out_csv, index=False)
 
+
+# -----------------------------
+# Summary writer
+# -----------------------------
 
 def write_summary_txt(
     out_txt: Path,
@@ -295,6 +356,7 @@ def write_summary_txt(
     lines.append(f"discovered_pairs: {discovered_pairs}")
     lines.append(f"processed_pairs: {processed_pairs}")
 
+    # ---- timing ----
     if started_at is not None:
         lines.append(f"started_at: {started_at}")
     if finished_at is not None:
@@ -304,14 +366,16 @@ def write_summary_txt(
         lines.append(f"wall_time_hms: {_fmt_hms(wall_seconds)}")
 
     lines.append(f"missing_test_count: {len(missing_test_ids)}")
-    lines.append(
-        "missing_test_datasets: " + (", ".join(missing_test_ids) if missing_test_ids else "(none)")
-    )
+    if missing_test_ids:
+        lines.append("missing_test_datasets: " + ", ".join(missing_test_ids))
+    else:
+        lines.append("missing_test_datasets: (none)")
 
     lines.append(f"failed_count: {len(failed_ids)}")
-    lines.append(
-        "failed_datasets: " + (", ".join(failed_ids) if failed_ids else "(none)")
-    )
+    if failed_ids:
+        lines.append("failed_datasets: " + ", ".join(failed_ids))
+    else:
+        lines.append("failed_datasets: (none)")
 
     if avg_acc is None:
         lines.append("avg_accuracy_ok: (none)")
@@ -326,19 +390,22 @@ def write_summary_txt(
     out_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# -----------------------------
+# Main
+# -----------------------------
+
 def main() -> None:
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--root", required=True, help="Root folder containing *_train.csv and *_test.csv")
     ap.add_argument("--out-dir", required=True, help="Output directory for per-worker CSVs and merged results")
     ap.add_argument("--all-out", default=None, help="Path to merged ALL CSV (default: <out-dir>/msp_results.ALL.csv)")
-    ap.add_argument("--summary-txt", default=None, help="Path to summary txt (default: <out-dir>/msp_results.summary.txt)")
-    ap.add_argument("--workers", type=int, default=8, help="Number of worker processes")
-    ap.add_argument("--gpus", default=None, help="Comma-separated GPU ids to use (length must equal --workers)")
+    ap.add_argument("--summary-txt", default=None, help="Path to ONE global summary txt (default: <out-dir>/msp_results.summary.txt)")
+    ap.add_argument("--workers", type=int, default=8, help="Number of worker processes (usually #GPUs)")
+    ap.add_argument("--gpus", default=None, help="Comma-separated GPU ids to use (default: 0..workers-1)")
 
-    # NOTE: ckpt is now OPTIONAL to support auto-download by default.
-    ap.add_argument("--ckpt", default=None, help="Optional path to local Orion-MSP checkpoint (.ckpt)")
-    ap.add_argument("--no-auto-download", action="store_true", help="Disallow auto-download checkpoint")
+    ap.add_argument("--ckpt", required=True, help="Path to local Orion-MSP checkpoint (.ckpt)")
+    ap.add_argument("--no-auto-download", action="store_true", help="Disable any auto-download behavior")
 
     ap.add_argument("--device", default="cuda:0", help='Device string in workers (recommend: "cuda:0")')
     ap.add_argument("--batch-size", type=int, default=8)
@@ -351,7 +418,6 @@ def main() -> None:
     ap.add_argument("--only-datasets", type=str, default=None, help="Comma-separated dataset_ids to run")
     ap.add_argument("--skip-datasets", type=str, default=None, help="Comma-separated dataset_ids to skip")
 
-    # passthrough toggles (kept consistent with previous interface)
     ap.add_argument("--no-logloss", action="store_true")
     ap.add_argument("--no-f1", action="store_true")
     ap.add_argument("--no-proba", action="store_true")
@@ -376,9 +442,9 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    # ---- timing (TabICL-like) ----
+    # ---- run timing (aligned with benchmark_tabicl_dynamic.py) ----
     _t0 = time.time()
-    _started_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    _started_at = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
 
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -386,21 +452,15 @@ def main() -> None:
     root = Path(args.root)
     out_dir = Path(args.out_dir)
 
-    all_out = Path(args.all_out) if args.all_out else (out_dir / "msp_results.ALL.csv")
-    summary_txt = Path(args.summary_txt) if args.summary_txt else (out_dir / "msp_results.summary.txt")
+    if args.all_out is None:
+        all_out = out_dir / "msp_results.ALL.csv"
+    else:
+        all_out = Path(args.all_out)
 
-    # ---- checkpoint policy: prefer auto-download ----
-    ckpt_to_use: Optional[str] = None
-    if args.ckpt:
-        ckpt_path = Path(args.ckpt).expanduser()
-        if ckpt_path.exists():
-            ckpt_to_use = str(ckpt_path)
-        else:
-            if args.no_auto_download:
-                raise FileNotFoundError(f"--ckpt provided but not found: {ckpt_path}")
-            # otherwise ignore local ckpt and allow auto-download
-            print(f"[WARN] --ckpt not found: {ckpt_path} ; will fall back to auto-download.")
-            ckpt_to_use = None
+    if args.summary_txt is None:
+        summary_txt = out_dir / "msp_results.summary.txt"
+    else:
+        summary_txt = Path(args.summary_txt)
 
     pairs, missing_test_ids = discover_train_test_pairs(root)
     discovered_pairs = len(pairs)
@@ -420,10 +480,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     queue_path = out_dir / "task_queue.jsonl"
     tasks = [{"train_csv": str(tr), "test_csv": str(te), "dataset_id": dsid} for tr, te, dsid in pairs]
-    queue_path.write_text(
-        "\n".join(json.dumps(t, ensure_ascii=False) for t in tasks) + ("\n" if tasks else ""),
-        encoding="utf-8",
-    )
+    queue_path.write_text("\n".join(json.dumps(t, ensure_ascii=False) for t in tasks) + ("\n" if tasks else ""), encoding="utf-8")
 
     # GPU ids
     if args.gpus is None:
@@ -434,14 +491,14 @@ def main() -> None:
             raise ValueError(f"--gpus length ({len(gpu_ids)}) must equal --workers ({args.workers})")
 
     # classifier kwargs
-    clf_kwargs: Dict = dict(
+    clf_kwargs = dict(
+        ckpt=args.ckpt,
         device=args.device,
         batch_size=args.batch_size,
         n_estimators=args.n_estimators,
         norm_methods=args.norm_methods,
         feat_shuffle=args.feat_shuffle,
         softmax_temp=args.softmax_temp,
-        # allow auto-download by default:
         no_auto_download=bool(args.no_auto_download),
         random_state=args.random_state,
         no_logloss=bool(args.no_logloss),
@@ -464,9 +521,6 @@ def main() -> None:
         no_earlystop=bool(args.no_earlystop),
         no_amp=bool(args.no_amp),
     )
-    # only set ckpt if we have an existing local file
-    if ckpt_to_use is not None:
-        clf_kwargs["ckpt"] = ckpt_to_use
 
     # spawn workers
     import multiprocessing as mp
@@ -513,7 +567,11 @@ def main() -> None:
 
     processed_pairs = int(len(all_df))
 
-    ok_df = all_df[(all_df.get("status") == "ok") & all_df.get("accuracy").notna()].copy() if len(all_df) else pd.DataFrame()
+    if len(all_df):
+        ok_df = all_df[(all_df["status"] == "ok") & all_df["accuracy"].notna()].copy()
+    else:
+        ok_df = pd.DataFrame(columns=["accuracy", "status", "dataset_id"])
+
     avg_acc = float(ok_df["accuracy"].mean()) if len(ok_df) > 0 else None
 
     topn_avgs: Dict[int, float] = {}
@@ -534,7 +592,7 @@ def main() -> None:
         )
         failed_ids = sorted(set(failed_ids))
 
-    _finished_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    _finished_at = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
     _wall_seconds = time.time() - _t0
 
     write_summary_txt(
@@ -551,6 +609,7 @@ def main() -> None:
         finished_at=_finished_at,
     )
 
+    # Print config for reproducibility
     print("\nSaved per-worker CSVs to:", str(out_dir))
     print("Saved merged ALL CSV to:", str(all_out))
     print("Saved summary TXT to:", str(summary_txt))
