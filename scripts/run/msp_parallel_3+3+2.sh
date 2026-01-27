@@ -2,6 +2,7 @@
 set -e
 
 PYTHON=python
+# 使用修复后的脚本（支持 HuggingFace 自动下载 ckpt + kwargs 对齐）
 SCRIPT=benchmark_orion_msp_dynamic.py
 
 DATA_ROOT=limix
@@ -10,6 +11,10 @@ mkdir -p "${OUT_ROOT}"
 
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
+
+# （可选）如果你想把 HF 缓存放到指定目录（比如大盘），取消注释即可：
+# export HF_HOME=/path/to/hf_home
+# export HUGGINGFACE_HUB_CACHE=/path/to/hf_home/hub
 
 COMMON_ARGS="
   --device cuda:0

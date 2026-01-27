@@ -38,24 +38,22 @@ import warnings
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 TARGET_CANDIDATES = [
-    "target", "label", "class", "y",
-    "TARGET", "Label", "Class", "Y",
+    "target",
+    "label",
+    "y",
+    "class",
+    "Class",
+    "TARGET",
+    "Label",
+    "Y",
 ]
 
 
-def _fmt_hms(seconds: float) -> str:
-    total = int(round(seconds))
-    h = total // 3600
-    m = (total % 3600) // 60
-    s = total % 60
-    return f"{h}:{m:02d}:{s:02d}"
-
-
-def sanitize_dataset_id(train_path: Path) -> str:
-    m = re.search(r"(OpenML-ID-\d+)", str(train_path))
-    if m:
-        return m.group(1)
-    return train_path.stem.replace("_train", "").replace("_TRAIN", "")
+def sanitize_dataset_id(p: Path) -> str:
+    s = p.stem
+    s = re.sub(r"(_train|_TRAIN)$", "", s)
+    s = re.sub(r"[^A-Za-z0-9_.\-]+", "_", s)
+    return s
 
 
 def discover_train_test_pairs(root: Path) -> Tuple[List[Tuple[Path, Path, str]], List[str]]:
@@ -109,21 +107,48 @@ def eval_one_dataset(
         # Local import to avoid GPU init in parent process
         from orion_msp import OrionMSPClassifier  # type: ignore
 
-        clf = OrionMSPClassifier(**clf_kwargs)
+        # ---- filter/compat kwargs (keep CLI flags in clf_kwargs, but only pass accepted ones) ----
+        import inspect
+        sig = inspect.signature(OrionMSPClassifier.__init__)
+        accepted = set(sig.parameters.keys()) - {"self"}
+
+        _kw = dict(clf_kwargs)
+        # backward/alias support
+        if "feat_shuffle" in _kw and "feat_shuffle_method" not in _kw:
+            _kw["feat_shuffle_method"] = _kw.pop("feat_shuffle")
+        if "softmax_temp" in _kw and "softmax_temperature" not in _kw:
+            _kw["softmax_temperature"] = _kw.pop("softmax_temp")
+        if "ckpt" in _kw and "model_path" not in _kw:
+            _kw["model_path"] = _kw.pop("ckpt")
+        if "no_auto_download" in _kw and "allow_auto_download" not in _kw:
+            _kw["allow_auto_download"] = (not bool(_kw.pop("no_auto_download")))
+
+        model_kwargs = {k: v for k, v in _kw.items() if k in accepted}
+
+        clf = OrionMSPClassifier(**model_kwargs)
         clf.fit(X_train, y_train)
 
         y_pred = clf.predict(X_test)
 
         acc = accuracy_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred, average="macro")
+
+        # optional metrics (controlled by CLI flags; defaults compute all)
+        no_f1 = bool(clf_kwargs.get("no_f1", False))
+        no_logloss = bool(clf_kwargs.get("no_logloss", False))
+        no_proba = bool(clf_kwargs.get("no_proba", False))
+
+        f1 = None
+        if not no_f1:
+            f1 = float(f1_score(y_test, y_pred, average="macro"))
 
         ll = None
-        try:
-            if hasattr(clf, "predict_proba"):
-                y_proba = clf.predict_proba(X_test)
-                ll = float(log_loss(y_test, y_proba))
-        except Exception:
-            ll = None
+        if (not no_logloss) and (not no_proba):
+            try:
+                if hasattr(clf, "predict_proba"):
+                    y_proba = clf.predict_proba(X_test)
+                    ll = float(log_loss(y_test, y_proba))
+            except Exception:
+                ll = None
 
         used_sec = time.time() - t0
         return {
@@ -136,7 +161,7 @@ def eval_one_dataset(
             "n_features": int(X_train.shape[1]),
             "target_col": str(target_col),
             "accuracy": float(acc),
-            "f1_macro": float(f1),
+            "f1_macro": (float(f1) if f1 is not None else None),
             "logloss": ll,
             "seconds": float(used_sec),
             "error": None,
@@ -230,7 +255,7 @@ def worker_loop(
                         f1_macro=None,
                         logloss=None,
                         seconds=0.0,
-                        error="lock_timeout",
+                        error="lock timeout",
                         traceback=None,
                         worker_id=worker_id,
                         gpu_id=gpu_id,
@@ -240,121 +265,79 @@ def worker_loop(
             break
 
         try:
-            if not queue_path.exists():
-                break
-
             lines = queue_path.read_text(encoding="utf-8").splitlines()
             if not lines:
-                queue_path.unlink(missing_ok=True)
                 break
-
-            first = lines[0]
-            rest = lines[1:]
-            queue_path.write_text("\n".join(rest) + ("\n" if rest else ""), encoding="utf-8")
-
+            task = json.loads(lines[0])
+            remaining = lines[1:]
+            queue_path.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
         finally:
             try:
                 lock_dir.rmdir()
             except Exception:
                 pass
 
-        task = json.loads(first)
         train_csv = Path(task["train_csv"])
         test_csv = Path(task["test_csv"])
         dataset_id = task["dataset_id"]
 
-        result = eval_one_dataset(
-            train_csv=train_csv,
-            test_csv=test_csv,
-            dataset_id=dataset_id,
-            clf_kwargs=clf_kwargs,
-            verbose=verbose,
-        )
+        if verbose:
+            print(f"[W{worker_id}][GPU{gpu_id}] start {dataset_id}")
 
-        rows.append(asdict(ResultRow(worker_id=worker_id, gpu_id=gpu_id, **result)))
+        r = eval_one_dataset(train_csv, test_csv, dataset_id, clf_kwargs, verbose=verbose)
+        r["worker_id"] = int(worker_id)
+        r["gpu_id"] = int(gpu_id)
 
+        rows.append(r)
+
+        df = pd.DataFrame(rows)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_csv, index=False)
+
+    df = pd.DataFrame(rows)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_csv(out_csv, index=False)
+    df.to_csv(out_csv, index=False)
 
 
-def write_summary_txt(
-    out_txt: Path,
-    root: Path,
-    discovered_pairs: int,
-    processed_pairs: int,
-    missing_test_ids: List[str],
-    failed_ids: List[str],
-    avg_acc: Optional[float],
-    topn_avgs: Dict[int, float],
-    wall_seconds: Optional[float] = None,
-    started_at: Optional[str] = None,
-    finished_at: Optional[str] = None,
-):
-    lines: List[str] = []
-    lines.append(f"root: {root}")
-    lines.append(f"discovered_pairs: {discovered_pairs}")
-    lines.append(f"processed_pairs: {processed_pairs}")
-
-    if started_at is not None:
-        lines.append(f"started_at: {started_at}")
-    if finished_at is not None:
-        lines.append(f"finished_at: {finished_at}")
-    if wall_seconds is not None:
-        lines.append(f"wall_seconds: {wall_seconds:.3f}")
-        lines.append(f"wall_time_hms: {_fmt_hms(wall_seconds)}")
-
-    lines.append(f"missing_test_count: {len(missing_test_ids)}")
-    lines.append(
-        "missing_test_datasets: " + (", ".join(missing_test_ids) if missing_test_ids else "(none)")
-    )
-
-    lines.append(f"failed_count: {len(failed_ids)}")
-    lines.append(
-        "failed_datasets: " + (", ".join(failed_ids) if failed_ids else "(none)")
-    )
-
-    if avg_acc is None:
-        lines.append("avg_accuracy_ok: (none)")
-    else:
-        lines.append(f"avg_accuracy_ok: {avg_acc:.6f}")
-
-    for n in (27, 63, 154):
-        if n in topn_avgs:
-            lines.append(f"avg_accuracy_ok_top_{n}: {topn_avgs[n]:.6f}")
-
-    out_txt.parent.mkdir(parents=True, exist_ok=True)
-    out_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def format_hms(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--root", type=str, required=True, help="Dataset root with *_train.csv and *_test.csv pairs")
+    ap.add_argument("--out-dir", type=str, required=True, help="Output directory")
+    ap.add_argument("--all-out", type=str, default="", help="Merged ALL CSV path (default: <out_dir>/msp_results.ALL.csv)")
+    ap.add_argument("--summary-txt", type=str, default="", help="Summary TXT path (default: <out_dir>/msp_results.summary.txt)")
 
-    ap.add_argument("--root", required=True, help="Root folder containing *_train.csv and *_test.csv")
-    ap.add_argument("--out-dir", required=True, help="Output directory for per-worker CSVs and merged results")
-    ap.add_argument("--all-out", default=None, help="Path to merged ALL CSV (default: <out-dir>/msp_results.ALL.csv)")
-    ap.add_argument("--summary-txt", default=None, help="Path to summary txt (default: <out-dir>/msp_results.summary.txt)")
-    ap.add_argument("--workers", type=int, default=8, help="Number of worker processes")
-    ap.add_argument("--gpus", default=None, help="Comma-separated GPU ids to use (length must equal --workers)")
+    ap.add_argument("--workers", type=int, default=1, help="Number of worker processes")
+    ap.add_argument("--gpus", type=str, default=None, help="Comma-separated GPU ids; length must equal --workers")
 
-    # NOTE: ckpt is now OPTIONAL to support auto-download by default.
-    ap.add_argument("--ckpt", default=None, help="Optional path to local Orion-MSP checkpoint (.ckpt)")
-    ap.add_argument("--no-auto-download", action="store_true", help="Disallow auto-download checkpoint")
-
-    ap.add_argument("--device", default="cuda:0", help='Device string in workers (recommend: "cuda:0")')
-    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--device", type=str, default="cuda:0", help='Device string (worker will force to "cuda:0")')
+    ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--n-estimators", type=int, default=32)
-    ap.add_argument("--norm-methods", default="none,power")
-    ap.add_argument("--feat-shuffle", default="latin")
+
+    ap.add_argument("--norm-methods", type=str, default="none,power", help="Comma list, e.g. none,power")
+    ap.add_argument("--feat-shuffle", type=str, default="latin", choices=["latin", "random", "none"])
     ap.add_argument("--softmax-temp", type=float, default=0.9)
 
-    ap.add_argument("--max-rows", type=int, default=None, help="Optional limit for debugging")
-    ap.add_argument("--only-datasets", type=str, default=None, help="Comma-separated dataset_ids to run")
-    ap.add_argument("--skip-datasets", type=str, default=None, help="Comma-separated dataset_ids to skip")
+    ap.add_argument("--ckpt", type=str, default="", help="Local ckpt path (optional). If missing, may auto-download.")
+    ap.add_argument("--no-auto-download", action="store_true", help="Disallow HF auto-download if ckpt missing")
 
-    # passthrough toggles (kept consistent with previous interface)
+    ap.add_argument("--max-rows", type=int, default=None)
+    ap.add_argument("--only-datasets", type=str, default="", help="Comma list of dataset ids to run")
+    ap.add_argument("--skip-datasets", type=str, default="", help="Comma list of dataset ids to skip")
+
+    # metric toggles
     ap.add_argument("--no-logloss", action="store_true")
     ap.add_argument("--no-f1", action="store_true")
     ap.add_argument("--no-proba", action="store_true")
+
+    # keep these flags for compatibility (they are not passed into OrionMSPClassifier unless supported)
     ap.add_argument("--no-calibration", action="store_true")
     ap.add_argument("--no-postprocess", action="store_true")
     ap.add_argument("--no-feature-selection", action="store_true")
@@ -371,6 +354,7 @@ def main() -> None:
     ap.add_argument("--no-subspace", action="store_true")
     ap.add_argument("--no-earlystop", action="store_true")
     ap.add_argument("--no-amp", action="store_true")
+
     ap.add_argument("--random-state", type=int, default=42)
     ap.add_argument("--verbose", action="store_true")
 
@@ -438,11 +422,11 @@ def main() -> None:
         device=args.device,
         batch_size=args.batch_size,
         n_estimators=args.n_estimators,
-        norm_methods=args.norm_methods,
-        feat_shuffle=args.feat_shuffle,
-        softmax_temp=args.softmax_temp,
+        norm_methods=[x.strip() for x in args.norm_methods.split(",") if x.strip()] if isinstance(args.norm_methods, str) else args.norm_methods,
+        feat_shuffle_method=args.feat_shuffle,
+        softmax_temperature=args.softmax_temp,
         # allow auto-download by default:
-        no_auto_download=bool(args.no_auto_download),
+        allow_auto_download=not bool(args.no_auto_download),
         random_state=args.random_state,
         no_logloss=bool(args.no_logloss),
         no_f1=bool(args.no_f1),
@@ -464,9 +448,17 @@ def main() -> None:
         no_earlystop=bool(args.no_earlystop),
         no_amp=bool(args.no_amp),
     )
-    # only set ckpt if we have an existing local file
+    # only set model_path if we have an existing local file
     if ckpt_to_use is not None:
-        clf_kwargs["ckpt"] = ckpt_to_use
+        clf_kwargs["model_path"] = ckpt_to_use
+
+    print("[INFO] discovered_pairs =", discovered_pairs)
+    if missing_test_ids:
+        print("[WARN] missing test for:", ", ".join(missing_test_ids[:20]), (" ..." if len(missing_test_ids) > 20 else ""))
+
+    print("[INFO] tasks_to_run =", len(pairs))
+    print("[INFO] clf_kwargs =")
+    print(json.dumps(clf_kwargs, indent=2, ensure_ascii=False))
 
     # spawn workers
     import multiprocessing as mp
@@ -518,44 +510,38 @@ def main() -> None:
 
     topn_avgs: Dict[int, float] = {}
     if len(ok_df) > 0:
-        ok_sorted = ok_df.sort_values("accuracy", ascending=False, kind="mergesort")
-        ok_count = len(ok_sorted)
-        for n in (27, 63, 154):
-            if ok_count >= n:
-                topn_avgs[n] = float(ok_sorted.head(n)["accuracy"].mean())
+        ok_df_sorted = ok_df.sort_values("accuracy", ascending=False)
+        for n in [1, 3, 5, 10]:
+            sub = ok_df_sorted.head(n)
+            if len(sub) > 0:
+                topn_avgs[n] = float(sub["accuracy"].mean())
 
-    failed_ids: List[str] = []
-    if len(all_df):
-        failed_ids = (
-            all_df.loc[all_df["status"] == "fail", "dataset_id"]
-            .dropna()
-            .astype(str)
-            .tolist()
-        )
-        failed_ids = sorted(set(failed_ids))
+    wall_seconds = float(time.time() - _t0)
+    finished_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
-    _finished_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    _wall_seconds = time.time() - _t0
+    summary_lines = [
+        f"started_at: {_started_at}",
+        f"finished_at: {finished_at}",
+        f"wall_seconds: {wall_seconds:.3f}",
+        f"wall_time_hms: {format_hms(wall_seconds)}",
+        "",
+        f"discovered_pairs: {discovered_pairs}",
+        f"tasks_to_run: {len(pairs)}",
+        f"processed_pairs: {processed_pairs}",
+        f"ok_pairs: {int(len(ok_df)) if ok_df is not None else 0}",
+        "",
+        f"avg_accuracy: {avg_acc if avg_acc is not None else 'NA'}",
+    ]
+    if topn_avgs:
+        summary_lines.append("topN_avg_accuracy:")
+        for n, v in topn_avgs.items():
+            summary_lines.append(f"  top{n}: {v:.6f}")
 
-    write_summary_txt(
-        out_txt=summary_txt,
-        root=root,
-        discovered_pairs=discovered_pairs,
-        processed_pairs=processed_pairs,
-        missing_test_ids=missing_test_ids,
-        failed_ids=failed_ids,
-        avg_acc=avg_acc,
-        topn_avgs=topn_avgs,
-        wall_seconds=_wall_seconds,
-        started_at=_started_at,
-        finished_at=_finished_at,
-    )
+    summary_txt.parent.mkdir(parents=True, exist_ok=True)
+    summary_txt.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
-    print("\nSaved per-worker CSVs to:", str(out_dir))
-    print("Saved merged ALL CSV to:", str(all_out))
-    print("Saved summary TXT to:", str(summary_txt))
-    print("\nOrion-MSP kwargs:")
-    print(json.dumps(clf_kwargs, indent=2, ensure_ascii=False))
+    print("[DONE] wrote:", str(all_out))
+    print("[DONE] wrote:", str(summary_txt))
 
 
 if __name__ == "__main__":
