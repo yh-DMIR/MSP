@@ -2,7 +2,7 @@
 set -e
 
 PYTHON=python
-SCRIPT=benchmark_orion_msp_dynamic.py
+SCRIPT=benchmark_orion_msp_dynamic_with_time_v3.py
 
 DATA_ROOT=limix
 OUT_ROOT=results/msp_parallel_3+3+2_msp
@@ -11,8 +11,6 @@ mkdir -p "${OUT_ROOT}"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-LOCAL_CKPT_PATH="./Orion-MSP-v1.0.ckpt"
-
 COMMON_ARGS="
   --device cuda:0
   --batch-size 4
@@ -20,13 +18,12 @@ COMMON_ARGS="
   --norm-methods none,power
   --feat-shuffle latin
   --softmax-temp 0.9
-  --ckpt ${LOCAL_CKPT_PATH}
   --verbose
 "
 
 echo "🚀 Launching TALENT(0,1,2) + TabZilla(3,4,5) + OpenML-CC18(6,7) in parallel..."
 
-# TALENT -> GPU 0,1,2
+# TALENT
 (
   ${PYTHON} ${SCRIPT} \
     --root "${DATA_ROOT}/talent_csv" \
@@ -38,7 +35,7 @@ echo "🚀 Launching TALENT(0,1,2) + TabZilla(3,4,5) + OpenML-CC18(6,7) in paral
     ${COMMON_ARGS}
 ) &
 
-# TabZilla -> GPU 3,4,5
+# TabZilla
 (
   ${PYTHON} ${SCRIPT} \
     --root "${DATA_ROOT}/tabzilla_csv" \
@@ -50,7 +47,7 @@ echo "🚀 Launching TALENT(0,1,2) + TabZilla(3,4,5) + OpenML-CC18(6,7) in paral
     ${COMMON_ARGS}
 ) &
 
-# OpenML-CC18 -> GPU 6,7
+# OpenML-CC18
 (
   ${PYTHON} ${SCRIPT} \
     --root "${DATA_ROOT}/openml_cc18_csv" \
