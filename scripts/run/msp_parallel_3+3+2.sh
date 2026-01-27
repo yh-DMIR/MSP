@@ -21,7 +21,6 @@ COMMON_ARGS="
   --feat-shuffle latin
   --softmax-temp 0.9
   --ckpt ${LOCAL_CKPT_PATH}
-  --no-auto-download
   --verbose
 "
 
