@@ -2,7 +2,7 @@
 set -e
 
 PYTHON=python
-SCRIPT=benchmark_orion_msp_dynamic_with_time_v2.py
+SCRIPT=benchmark_orion_msp_dynamic.py
 
 DATA_ROOT=limix
 OUT_ROOT=results/msp_parallel_3+3+2_msp
