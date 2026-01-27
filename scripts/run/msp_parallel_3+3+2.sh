@@ -5,7 +5,7 @@ PYTHON=python
 SCRIPT=benchmark_orion_msp_dynamic_with_time_v2.py
 
 DATA_ROOT=limix
-OUT_ROOT=results/v1.1_parallel_3+3+2_msp
+OUT_ROOT=results/msp_parallel_3+3+2_msp
 mkdir -p "${OUT_ROOT}"
 
 export OMP_NUM_THREADS=1
