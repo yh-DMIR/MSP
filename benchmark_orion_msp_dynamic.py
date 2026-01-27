@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Dynamic multi-GPU benchmark runner for Orion-MSP (AMD/ROCm friendly).
+"""
+Dynamic multi-GPU benchmark runner for Orion-MSP (AMD/ROCm friendly).
 
 This script mirrors the output layout and multi-process scheduling strategy of
 `benchmark_tabicl_dynamic.py`, but evaluates `OrionMSPClassifier`.
@@ -17,15 +18,8 @@ Key features:
   - avg_accuracy_ok: mean accuracy over all OK results
   - avg_accuracy_ok_top_{27,63,154}: mean accuracy of top-N datasets by accuracy (descending),
     computed only if #OK-with-accuracy >= N.
-
-Example:
-  python benchmark_orion_msp_dynamic.py \
-    --root limix/tabzilla_csv \
-    --out-dir results/msp_dynamic/tabzilla \
-    --workers 8 \
-    --ckpt ./Orion-MSP-v1.0.ckpt \
-    --no-auto-download \
-    --device cuda:0
+- Adds TabICL-like timing summary:
+  started_at / finished_at / wall_seconds / wall_time_hms
 """
 
 from __future__ import annotations
@@ -40,6 +34,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
+import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, log_loss
 from sklearn.exceptions import UndefinedMetricWarning
@@ -55,6 +50,14 @@ TARGET_CANDIDATES = [
     "target", "label", "class", "y",
     "TARGET", "Label", "Class", "Y",
 ]
+
+
+def _fmt_hms(seconds: float) -> str:
+    total = int(round(seconds))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h}:{m:02d}:{s:02d}"
 
 
 def sanitize_dataset_id(train_path: Path) -> str:
@@ -88,17 +91,6 @@ def infer_target_column(train_df: pd.DataFrame, test_df: pd.DataFrame) -> str:
     if len(extra) == 1:
         return extra[0]
     return train_df.columns[-1]
-
-
-def _normalize_local_ckpt_path(ckpt: str) -> str:
-    mp = Path(ckpt).expanduser()
-    try:
-        mp = mp.resolve()
-    except Exception:
-        pass
-    if not mp.exists():
-        raise FileNotFoundError(f"Local checkpoint not found: {mp}")
-    return str(mp)
 
 
 def _default_all_out(out_dir: Path) -> Path:
@@ -158,23 +150,48 @@ def run_one_dataset_with_clf(
             X_test = test_df
             y_test = None
 
+        # fit timing
         t0 = time.time()
         clf.fit(X_train, y_train)
         fit_s = time.time() - t0
 
+        # predict timing (TabICL-style: avoid duplicate inference)
         t1 = time.time()
-        y_pred = clf.predict(X_test)
+
+        y_pred = None
+        proba = None
+        ll = None
+
+        if y_test is not None and hasattr(clf, "predict_proba"):
+            # One pass: proba -> y_pred
+            try:
+                proba = clf.predict_proba(X_test)
+                classes_ = getattr(clf, "classes_", None)
+                if classes_ is None:
+                    # fallback: predict if no classes_
+                    y_pred = clf.predict(X_test)
+                    proba = None
+                else:
+                    idx = np.argmax(proba, axis=1)
+                    y_pred = np.asarray(classes_)[idx]
+            except Exception:
+                # fallback: predict only
+                y_pred = clf.predict(X_test)
+                proba = None
+        else:
+            y_pred = clf.predict(X_test)
+
         pred_s = time.time() - t1
 
         if y_test is not None:
             acc = accuracy_score(y_test, y_pred)
             f1w = f1_score(y_test, y_pred, average="weighted")
 
-            try:
-                proba = clf.predict_proba(X_test)
-                ll = log_loss(y_test, proba, labels=getattr(clf, "classes_", None))
-            except Exception:
-                ll = None
+            if proba is not None:
+                try:
+                    ll = log_loss(y_test, proba, labels=getattr(clf, "classes_", None))
+                except Exception:
+                    ll = None
 
             n_classes = int(getattr(clf, "n_classes_", pd.Series(y_train).nunique()))
         else:
@@ -290,11 +307,23 @@ def write_summary_txt(
     failed_ids: List[str],
     avg_acc: Optional[float],
     topn_avgs: Dict[int, float],
+    wall_seconds: Optional[float] = None,
+    started_at: Optional[str] = None,
+    finished_at: Optional[str] = None,
 ):
     lines: List[str] = []
     lines.append(f"root: {root}")
     lines.append(f"discovered_pairs: {discovered_pairs}")
     lines.append(f"processed_pairs: {processed_pairs}")
+
+    # ---- timing (TabICL-like) ----
+    if started_at is not None:
+        lines.append(f"started_at: {started_at}")
+    if finished_at is not None:
+        lines.append(f"finished_at: {finished_at}")
+    if wall_seconds is not None:
+        lines.append(f"wall_seconds: {wall_seconds:.3f}")
+        lines.append(f"wall_time_hms: {_fmt_hms(wall_seconds)}")
 
     lines.append(f"missing_test_count: {len(missing_test_ids)}")
     if missing_test_ids:
@@ -352,6 +381,10 @@ def main() -> None:
 
     args = ap.parse_args()
 
+    # ---- whole-run timing start ----
+    run_start_ts = time.time()
+    started_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(run_start_ts))
+
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
@@ -371,6 +404,10 @@ def main() -> None:
         all_out.parent.mkdir(parents=True, exist_ok=True)
         empty_df.to_csv(all_out, index=False)
 
+        run_end_ts = time.time()
+        finished_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(run_end_ts))
+        wall_seconds = run_end_ts - run_start_ts
+
         write_summary_txt(
             out_txt=summary_txt,
             root=root,
@@ -380,6 +417,9 @@ def main() -> None:
             failed_ids=[],
             avg_acc=None,
             topn_avgs={},
+            wall_seconds=wall_seconds,
+            started_at=started_at,
+            finished_at=finished_at,
         )
         print("No dataset pairs found. Wrote empty outputs.")
         return
@@ -396,7 +436,27 @@ def main() -> None:
         gpu_ids = list(range(workers))
 
     norm_methods = [x.strip() for x in args.norm_methods.split(",") if x.strip()]
-    ckpt_path = _normalize_local_ckpt_path(args.ckpt)
+
+    # ---- checkpoint policy (no interface change) ----
+    # If ckpt exists -> use it
+    # If not exists:
+    #   - with --no-auto-download: error
+    #   - otherwise: allow classifier to auto-download to that path
+    ckpt_path_obj = Path(args.ckpt).expanduser()
+    try:
+        ckpt_path_obj = ckpt_path_obj.resolve()
+    except Exception:
+        pass
+
+    if ckpt_path_obj.exists():
+        ckpt_path = str(ckpt_path_obj)
+    else:
+        if args.no_auto_download:
+            raise FileNotFoundError(f"Local checkpoint not found and auto-download disabled: {ckpt_path_obj}")
+        ckpt_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        ckpt_path = str(ckpt_path_obj)
+        print(f"[INFO] Checkpoint '{ckpt_path_obj.name}' not cached.")
+        print("Downloading from Hugging Face Hub (Lexsi/Orion-MSP).")
 
     clf_kwargs: Dict = dict(
         n_estimators=args.n_estimators,
@@ -490,6 +550,11 @@ def main() -> None:
         )
         failed_ids = sorted(set(failed_ids))
 
+    # ---- whole-run timing end ----
+    run_end_ts = time.time()
+    finished_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(run_end_ts))
+    wall_seconds = run_end_ts - run_start_ts
+
     write_summary_txt(
         out_txt=summary_txt,
         root=root,
@@ -499,12 +564,16 @@ def main() -> None:
         failed_ids=failed_ids,
         avg_acc=avg_acc,
         topn_avgs=topn_avgs,
+        wall_seconds=wall_seconds,
+        started_at=started_at,
+        finished_at=finished_at,
     )
 
-    # Print config for reproducibility
     print("\nSaved per-worker CSVs to:", str(out_dir))
     print("Saved merged ALL CSV to:", str(all_out))
     print("Saved summary TXT to:", str(summary_txt))
+    print(f"\nTotal wall time: {wall_seconds:.3f}s ({_fmt_hms(wall_seconds)})")
+
     print("\nOrion-MSP kwargs:")
     print(json.dumps(clf_kwargs, indent=2, ensure_ascii=False))
 

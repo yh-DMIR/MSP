@@ -2,19 +2,29 @@
 set -e
 
 PYTHON=python
-# 使用修复后的脚本（支持 HuggingFace 自动下载 ckpt + kwargs 对齐）
 SCRIPT=benchmark_orion_msp_dynamic.py
 
 DATA_ROOT=limix
-OUT_ROOT=results/msp_parallel_3+3+2_msp
+OUT_ROOT=results/msp_parallel_3+3+2
 mkdir -p "${OUT_ROOT}"
 
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-# （可选）如果你想把 HF 缓存放到指定目录（比如大盘），取消注释即可：
+# （可选）把 HF 缓存放到指定目录，避免写到 ~/.cache
 # export HF_HOME=/path/to/hf_home
 # export HUGGINGFACE_HUB_CACHE=/path/to/hf_home/hub
+
+CKPT_VERSION=Orion-MSP-v1.0.ckpt
+LOCAL_CKPT_PATH="./checkpoints/${CKPT_VERSION}"
+mkdir -p "$(dirname "${LOCAL_CKPT_PATH}")"
+
+# --- Warmup: 先预下载一次，避免并行 workers 同时抢下载锁看起来“0%卡住” ---
+${PYTHON} - <<'PY'
+from huggingface_hub import hf_hub_download
+p = hf_hub_download(repo_id="Lexsi/Orion-MSP", filename="Orion-MSP-v1.0.ckpt")
+print("Downloaded/cached at:", p)
+PY
 
 COMMON_ARGS="
   --device cuda:0
@@ -23,6 +33,7 @@ COMMON_ARGS="
   --norm-methods none,power
   --feat-shuffle latin
   --softmax-temp 0.9
+  --ckpt ${LOCAL_CKPT_PATH}
   --verbose
 "
 
