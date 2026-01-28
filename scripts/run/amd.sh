@@ -20,7 +20,7 @@ export MKL_NUM_THREADS=1
 # =========================
 # Orion-MSP 本地 ckpt 路径（离线机器必填）
 # =========================
-LOCAL_CKPT_PATH="./Orion-MSP-v1.0.ckpt"
+LOCAL_CKPT_PATH="./checkpoints/Orion-MSP-v1.0.ckpt"
 
 # =========================
 # GPU/worker 设置（8 卡 AMD）
