@@ -1,0 +1,15 @@
+root: limix/talent_csv
+discovered_pairs: 181
+processed_pairs: 181
+started_at: 2026-01-28 06:49:37
+finished_at: 2026-01-28 09:34:53
+wall_seconds: 9916.395
+wall_time_hms: 2:45:16
+missing_test_count: 0
+missing_test_datasets: (none)
+failed_count: 0
+failed_datasets: (none)
+avg_accuracy_ok: 0.813879
+avg_accuracy_ok_top_27: 0.986317
+avg_accuracy_ok_top_63: 0.960348
+avg_accuracy_ok_top_154: 0.861676
