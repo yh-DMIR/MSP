@@ -1,0 +1,15 @@
+root: limix/talent_csv
+discovered_pairs: 181
+processed_pairs: 181
+started_at: 2026-01-28 02:19:53
+finished_at: 2026-01-28 05:10:00
+wall_seconds: 10206.989
+wall_time_hms: 2:50:07
+missing_test_count: 0
+missing_test_datasets: (none)
+failed_count: 7
+failed_datasets: Amazon_employee_access, BNG(breast-w), BNG(cmc), BNG(tic-tac-toe), Bank_Customer_Churn_Dataset, Basketball_c, CDC_Diabetes_Health_Indicators
+avg_accuracy_ok: 0.813564
+avg_accuracy_ok_top_27: 0.985814
+avg_accuracy_ok_top_63: 0.958360
+avg_accuracy_ok_top_154: 0.852303

@@ -1,0 +1,6 @@
+dataset_id,n_train,n_test,n_features,n_classes,accuracy,f1_weighted,logloss,fit_seconds,predict_seconds,status,error
+OpenML-ID-1067,0,0,0,,,,,0.0,0.0,fail,RuntimeError: PytorchStreamReader failed reading zip archive: failed finding central directory
+OpenML-ID-14,0,0,0,,,,,0.0,0.0,fail,RuntimeError: PytorchStreamReader failed reading zip archive: failed finding central directory
+OpenML-ID-1486,0,0,0,,,,,0.0,0.0,fail,RuntimeError: PytorchStreamReader failed reading file data/145: file read failed
+OpenML-ID-1565,235,59,13,5.0,0.711864406779661,0.6711729889695991,0.7593287384802776,3.996210813522339,5.66744327545166,ok,
+OpenML-ID-1567,820007,205002,10,10.0,0.5682042126418279,0.5458196246930278,,4.181938171386719,10224.567442417145,ok,
