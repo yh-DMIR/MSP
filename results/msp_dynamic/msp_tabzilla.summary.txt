@@ -1,0 +1,13 @@
+root: limix/tabzilla_csv
+discovered_pairs: 35
+processed_pairs: 35
+started_at: 2026-01-28 13:39:19
+finished_at: 2026-01-28 16:39:44
+wall_seconds: 10824.685
+wall_time_hms: 3:00:25
+missing_test_count: 0
+missing_test_datasets: (none)
+failed_count: 2
+failed_datasets: OpenML-ID-1468, OpenML-ID-41147
+avg_accuracy_ok: 0.836327
+avg_accuracy_ok_top_27: 0.872428
