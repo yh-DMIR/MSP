@@ -1,2 +1,3 @@
-dataset_id,n_train,n_test,n_features,n_classes,accuracy,f1_weighted,logloss,fit_seconds,predict_seconds,status,error
-OpenML-ID-1169,431506,107877,7,2,0.6388015981163733,0.6230267572673475,,4.119711875915527,2373.2916135787964,ok,
+version https://git-lfs.github.com/spec/v1
+oid sha256:9bb031f81dc6b1bd2ecb1160bac6ed879b685249d4b740fabfeaed61835ef563
+size 232
