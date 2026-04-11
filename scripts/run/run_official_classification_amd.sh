@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DATASET_ROOT=${DATASET_ROOT:-${REPO_ROOT}/dataset}
+
 mkdir -p /tmp/$USER/comgr
 export TMPDIR=/tmp/$USER
 export TEMP=/tmp/$USER
@@ -8,18 +12,18 @@ export TMP=/tmp/$USER
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}src"
+export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${REPO_ROOT}/src"
 unset HIP_VISIBLE_DEVICES
 unset CUDA_VISIBLE_DEVICES
 unset ROCR_VISIBLE_DEVICES
 unset GPU_DEVICE_ORDINAL
 
 PYTHON=${PYTHON:-python}
-SCRIPT=${SCRIPT:-benchmark_orion_msp_classification_amd.py}
-ROOT=${ROOT:-.}
-BENCHMARKS=${BENCHMARKS:-openml_cc18_csv=dataset/openml_cc18_72,tabarena_cls=dataset/tabarena/cls,tabzilla_csv=dataset/tabzilla35,talent_cls=dataset/talent_cls}
-MODEL_PATH=${MODEL_PATH:-ckpt/Orion-MSP-v1.0.ckpt}
-OUT_DIR=${OUT_DIR:-results/OrionMSP_official_classification}
+SCRIPT=${SCRIPT:-${REPO_ROOT}/benchmark_orion_msp_classification_amd.py}
+ROOT=${ROOT:-${REPO_ROOT}}
+BENCHMARKS=${BENCHMARKS:-openml_cc18_csv=${DATASET_ROOT}/openml_cc18_72,tabarena_cls=${DATASET_ROOT}/tabarena/cls,tabzilla_csv=${DATASET_ROOT}/tabzilla35,talent_cls=${DATASET_ROOT}/talent_cls}
+MODEL_PATH=${MODEL_PATH:-${REPO_ROOT}/ckpt/Orion-MSP-v1.0.ckpt}
+OUT_DIR=${OUT_DIR:-${REPO_ROOT}/results/OrionMSP_official_classification}
 WORKERS=${WORKERS:-8}
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
 
