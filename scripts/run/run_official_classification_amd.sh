@@ -3,7 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-DATASET_ROOT=${DATASET_ROOT:-${REPO_ROOT}/dataset}
+DEFAULT_EXTERNAL_DATASET_ROOT="/vast/users/guangyi.chen/causal_group/zijian.li/dmir_crl/lyh/TabDPT/dataset"
+if [[ -z "${DATASET_ROOT:-}" ]]; then
+  if [[ -d "${DEFAULT_EXTERNAL_DATASET_ROOT}" ]]; then
+    DATASET_ROOT="${DEFAULT_EXTERNAL_DATASET_ROOT}"
+  else
+    DATASET_ROOT="${REPO_ROOT}/dataset"
+  fi
+fi
 
 mkdir -p /tmp/$USER/comgr
 export TMPDIR=/tmp/$USER
